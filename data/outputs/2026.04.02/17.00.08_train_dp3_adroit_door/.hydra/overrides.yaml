@@ -1,0 +1,5 @@
+- task=adroit_door
+- training.seed=0
+- training.device=cuda:0
+- exp_name=adroit_door-dp3-0322
+- logging.mode=offline

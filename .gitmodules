@@ -1,0 +1,3 @@
+[submodule "third_party/newton"]
+	path = third_party/newton
+	url = git@github.com:VatsinShah86/newton.git
