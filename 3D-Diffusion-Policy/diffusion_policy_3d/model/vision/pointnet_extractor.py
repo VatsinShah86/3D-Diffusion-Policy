@@ -65,7 +65,7 @@ class PointNetEncoderXYZRGB(nn.Module):
         """_summary_
 
         Args:
-            in_channels (int): feature size of input (3 or 6)
+            in_channels (int): feature size of input (>= 6)
             input_transform (bool, optional): whether to use transformation for coordinates. Defaults to True.
             feature_transform (bool, optional): whether to use transformation for features. Defaults to True.
             is_seg (bool, optional): for segmentation or classification. Defaults to False.
@@ -74,6 +74,10 @@ class PointNetEncoderXYZRGB(nn.Module):
         block_channel = [64, 128, 256, 512]
         cprint("pointnet use_layernorm: {}".format(use_layernorm), 'cyan')
         cprint("pointnet use_final_norm: {}".format(final_norm), 'cyan')
+        assert in_channels >= 6, cprint(
+            f"PointNetEncoderXYZRGB requires at least 6 channels, but got {in_channels}",
+            "red"
+        )
         
         self.mlp = nn.Sequential(
             nn.Linear(in_channels, block_channel[0]),
@@ -86,6 +90,8 @@ class PointNetEncoderXYZRGB(nn.Module):
             nn.LayerNorm(block_channel[2]) if use_layernorm else nn.Identity(),
             nn.ReLU(),
             nn.Linear(block_channel[2], block_channel[3]),
+            # nn.LayerNorm(block_channel[3]) if use_layernorm else nn.Identity(),
+            # nn.ReLU(),
         )
         
        
@@ -121,7 +127,7 @@ class PointNetEncoderXYZ(nn.Module):
         """_summary_
 
         Args:
-            in_channels (int): feature size of input (3 or 6)
+            in_channels (int): feature size of input (3)
             input_transform (bool, optional): whether to use transformation for coordinates. Defaults to True.
             feature_transform (bool, optional): whether to use transformation for features. Defaults to True.
             is_seg (bool, optional): for segmentation or classification. Defaults to False.
@@ -202,14 +208,17 @@ class PointNetEncoderXYZ(nn.Module):
 
 
 class DP3Encoder(nn.Module):
-    def __init__(self, 
-                 observation_space: Dict, 
+    def __init__(self,
+                 observation_space: Dict,
                  img_crop_shape=None,
                  out_channel=256,
                  state_mlp_size=(64, 64), state_mlp_activation_fn=nn.ReLU,
                  pointcloud_encoder_cfg=None,
                  use_pc_color=False,
                  pointnet_type='pointnet',
+                 one_hot_seg=False,
+                 seg_channel_idx=6,
+                 num_seg_classes=3,
                  ):
         super().__init__()
         self.imagination_key = 'imagin_robot'
@@ -235,9 +244,33 @@ class DP3Encoder(nn.Module):
 
         self.use_pc_color = use_pc_color
         self.pointnet_type = pointnet_type
+        self.one_hot_seg = one_hot_seg
+        self.seg_channel_idx = seg_channel_idx
+        self.num_seg_classes = num_seg_classes
+
+        if one_hot_seg and not use_pc_color:
+            raise ValueError("one_hot_seg=True requires use_pc_color=True")
+
         if pointnet_type == "pointnet":
+            if len(self.point_cloud_shape) != 2:
+                raise ValueError(
+                    f"Point cloud shape must be [num_points, feature_dim], got {self.point_cloud_shape}"
+                )
+
+            pointcloud_encoder_cfg = copy.deepcopy(pointcloud_encoder_cfg)
             if use_pc_color:
-                pointcloud_encoder_cfg.in_channels = 6
+                pointcloud_feature_dim = self.point_cloud_shape[-1]
+                if pointcloud_feature_dim < 6:
+                    raise ValueError(
+                        f"use_pc_color=True requires point clouds with at least 6 features, "
+                        f"got shape {self.point_cloud_shape}"
+                    )
+                if one_hot_seg:
+                    # scalar seg channel → num_seg_classes one-hot channels
+                    effective_channels = pointcloud_feature_dim - 1 + num_seg_classes
+                else:
+                    effective_channels = pointcloud_feature_dim
+                pointcloud_encoder_cfg.in_channels = effective_channels
                 self.extractor = PointNetEncoderXYZRGB(**pointcloud_encoder_cfg)
             else:
                 pointcloud_encoder_cfg.in_channels = 3
@@ -263,12 +296,18 @@ class DP3Encoder(nn.Module):
     def forward(self, observations: Dict) -> torch.Tensor:
         points = observations[self.point_cloud_key]
         assert len(points.shape) == 3, cprint(f"point cloud shape: {points.shape}, length should be 3", "red")
+
+        if self.one_hot_seg:
+            seg = points[..., self.seg_channel_idx]
+            # Limits normalizer maps {1,2,3} → {-1,0,1} exactly; recover 0-indexed class.
+            seg_idx = (seg + 1.0).round().clamp(0, self.num_seg_classes - 1).long()
+            one_hot = F.one_hot(seg_idx, num_classes=self.num_seg_classes).float()
+            points = torch.cat([points[..., :self.seg_channel_idx], one_hot], dim=-1)
+
         if self.use_imagined_robot:
             img_points = observations[self.imagination_key][..., :points.shape[-1]] # align the last dim
             points = torch.concat([points, img_points], dim=1)
-        
-        # points = torch.transpose(points, 1, 2)   # B * 3 * N
-        # points: B * 3 * (N + sum(Ni))
+
         pn_feat = self.extractor(points)    # B * out_channel
             
         state = observations[self.state_key]

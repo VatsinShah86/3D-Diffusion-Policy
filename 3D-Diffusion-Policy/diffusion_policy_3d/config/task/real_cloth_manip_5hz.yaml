@@ -1,0 +1,32 @@
+name: real_cloth_manip_5hz
+
+task_name: cloth
+
+shape_meta: &shape_meta
+  # acceptable types: rgb, low_dim
+  obs:
+    point_cloud:
+      shape: [2048, 7]
+      type: point_cloud
+    agent_pos:
+      shape: [7]
+      type: low_dim
+  action:
+    shape: [7]
+
+env_runner: null
+
+dataset:
+  _target_: diffusion_policy_3d.dataset.episode_zarr_dataset.EpisodeZarrDataset
+  zarr_path: data/real_dataset_cloth_5Hz
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.2
+  max_train_episodes: 90
+  augment: ${augment}
+  aug_xyz_sigma: 0.007
+  aug_dropout_frame_ratio: 0.20
+  aug_dropout_ratio: 0.30
+  aug_color_sigma: 15.0

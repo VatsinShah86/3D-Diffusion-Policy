@@ -39,6 +39,9 @@ class DP3(BasePolicy):
             use_pc_color=False,
             pointnet_type="pointnet",
             pointcloud_encoder_cfg=None,
+            one_hot_seg=False,
+            seg_channel_idx=6,
+            num_seg_classes=3,
             # parameters passed to step
             **kwargs):
         super().__init__()
@@ -65,6 +68,9 @@ class DP3(BasePolicy):
                                                 pointcloud_encoder_cfg=pointcloud_encoder_cfg,
                                                 use_pc_color=use_pc_color,
                                                 pointnet_type=pointnet_type,
+                                                one_hot_seg=one_hot_seg,
+                                                seg_channel_idx=seg_channel_idx,
+                                                num_seg_classes=num_seg_classes,
                                                 )
 
         # create diffusion model
@@ -287,9 +293,6 @@ class DP3(BasePolicy):
             else:
                 # reshape back to B, Do
                 global_cond = nobs_features.reshape(batch_size, -1)
-            # this_n_point_cloud = this_nobs['imagin_robot'].reshape(batch_size,-1, *this_nobs['imagin_robot'].shape[1:])
-            this_n_point_cloud = this_nobs['point_cloud'].reshape(batch_size,-1, *this_nobs['point_cloud'].shape[1:])
-            this_n_point_cloud = this_n_point_cloud[..., :3]
         else:
             # reshape B, T, ... to B*T
             this_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))

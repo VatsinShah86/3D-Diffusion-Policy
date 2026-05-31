@@ -47,6 +47,7 @@ python train.py --config-name=${config_name}.yaml \
                             training.device="cuda:0" \
                             exp_name=${exp_name} \
                             logging.mode=${wandb_mode} \
+                            logging.name=${addition_info} \
                             checkpoint.save_ckpt=${save_ckpt}
 
 

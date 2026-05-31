@@ -87,8 +87,8 @@ class TrainDP3Workspace:
             RUN_CKPT = True
             verbose = False
         
-        RUN_VALIDATION = False # reduce time cost
-        
+
+        RUN_VALIDATION = True 
         # resume training
         if cfg.training.resume:
             lastest_ckpt_path = self.get_checkpoint_path()
@@ -113,6 +113,7 @@ class TrainDP3Workspace:
             self.ema_model.set_normalizer(normalizer)
 
         # configure lr scheduler
+        lr_scheduler_kwargs = dict(cfg.training.get("lr_scheduler_kwargs", {}))
         lr_scheduler = get_scheduler(
             cfg.training.lr_scheduler,
             optimizer=self.optimizer,
@@ -122,7 +123,8 @@ class TrainDP3Workspace:
                     // cfg.training.gradient_accumulate_every,
             # pytorch assumes stepping LRScheduler every epoch
             # however huggingface diffusers steps it every batch
-            last_epoch=self.global_step-1
+            last_epoch=self.global_step-1,
+            **lr_scheduler_kwargs,
         )
 
         # configure ema
@@ -163,6 +165,13 @@ class TrainDP3Workspace:
             save_dir=os.path.join(self.output_dir, 'checkpoints'),
             **cfg.checkpoint.topk
         )
+        best_val_manager = TopKCheckpointManager(
+            save_dir=os.path.join(self.output_dir, 'checkpoints'),
+            monitor_key='val_loss',
+            mode='min',
+            k=1,
+            format_str='epoch={epoch:04d}-val_loss={val_loss:.3f}.ckpt'
+        )
 
         # device transfer
         device = torch.device(cfg.training.device)
@@ -177,7 +186,7 @@ class TrainDP3Workspace:
 
         # training loop
         log_path = os.path.join(self.output_dir, 'logs.json.txt')
-        for local_epoch_idx in range(cfg.training.num_epochs):
+        for local_epoch_idx in range(cfg.training.num_epochs - self.epoch):
             step_log = dict()
             # ========= train for this epoch ==========
             train_losses = list()
@@ -270,7 +279,7 @@ class TrainDP3Workspace:
                             leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
                         for batch_idx, batch in enumerate(tepoch):
                             batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
-                            loss, loss_dict = self.model.compute_loss(batch)
+                            loss, loss_dict = policy.compute_loss(batch)
                             val_losses.append(loss)
                             if (cfg.training.max_val_steps is not None) \
                                 and batch_idx >= (cfg.training.max_val_steps-1):
@@ -279,6 +288,10 @@ class TrainDP3Workspace:
                         val_loss = torch.mean(torch.tensor(val_losses)).item()
                         # log epoch average validation loss
                         step_log['val_loss'] = val_loss
+                        best_val_ckpt_path = best_val_manager.get_ckpt_path(
+                            {'val_loss': val_loss, 'epoch': self.epoch})
+                        if best_val_ckpt_path is not None:
+                            self.save_checkpoint(path=best_val_ckpt_path)
 
             # run diffusion sampling on a training batch
             if (self.epoch % cfg.training.sample_every) == 0:
@@ -306,7 +319,7 @@ class TrainDP3Workspace:
             if (self.epoch % cfg.training.checkpoint_every) == 0 and cfg.checkpoint.save_ckpt:
                 # checkpointing
                 if cfg.checkpoint.save_last_ckpt:
-                    self.save_checkpoint()
+                    self.save_checkpoint(tag=f'epoch_{self.epoch}')
                 if cfg.checkpoint.save_last_snapshot:
                     self.save_snapshot()
 
@@ -332,6 +345,9 @@ class TrainDP3Workspace:
             self.global_step += 1
             self.epoch += 1
             del step_log
+
+        # save the final model regardless of checkpoint_every
+        self.save_checkpoint(tag=f'epoch_{self.epoch - 1}')
 
     def eval(self):
         # load the latest checkpoint

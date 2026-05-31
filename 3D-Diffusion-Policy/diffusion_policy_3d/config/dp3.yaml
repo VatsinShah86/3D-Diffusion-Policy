@@ -13,6 +13,7 @@ n_obs_steps: 5
 # n_action_steps: 3
 n_action_steps: 8
 n_latency_steps: 0
+augment: true  # set true to enable point-cloud augmentation on the training set
 dataset_obs_steps: ${n_obs_steps}
 keypoint_visible_rate: 1.0
 obs_as_global_cond: True
@@ -27,9 +28,10 @@ policy:
   
   diffusion_step_embed_dim: 128
   down_dims:
+  # - 128
+  - 256
   - 512
   - 1024
-  - 2048
   crop_shape:
   - 80
   - 80
@@ -58,10 +60,12 @@ policy:
 
   use_pc_color: true
   pointnet_type: "pointnet"
-
+  one_hot_seg: true
+  seg_channel_idx: 6
+  num_seg_classes: 3
 
   pointcloud_encoder_cfg:
-    in_channels: 3
+    in_channels: 7
     out_channels: ${policy.encoder_output_dim}
     use_layernorm: true
     final_norm: layernorm # layernorm, none
@@ -92,10 +96,10 @@ val_dataloader:
 
 optimizer:
   _target_: torch.optim.AdamW
-  lr: 1.0e-4
+  lr: 5.0e-5
   betas: [0.95, 0.999]
   eps: 1.0e-8
-  weight_decay: 1.0e-6
+  weight_decay: 5.0e-2
 
 training:
   device: "cuda:0"
@@ -104,12 +108,14 @@ training:
   resume: True
   lr_scheduler: cosine
   lr_warmup_steps: 500
-  num_epochs: 3000
+  # lr_scheduler_kwargs:
+  #   num_cycles: 5
+  num_epochs: 1500
   gradient_accumulate_every: 1
   use_ema: True
   rollout_every: 200
-  checkpoint_every: 200
-  val_every: 1
+  checkpoint_every: 100
+  val_every: 2
   sample_every: 5
   max_train_steps: null
   max_val_steps: null
@@ -126,14 +132,14 @@ logging:
   - dp3
 
 checkpoint:
-  save_ckpt: False # if True, save checkpoint every checkpoint_every
+  save_ckpt: True
   topk:
     monitor_key: test_mean_score
     mode: max
     k: 1
     format_str: 'epoch={epoch:04d}-test_mean_score={test_mean_score:.3f}.ckpt'
-  save_last_ckpt: True # this only saves when save_ckpt is True
-  save_last_snapshot: False
+  save_last_ckpt: True
+  save_last_snapshot: True
 
 multi_run:
   run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
