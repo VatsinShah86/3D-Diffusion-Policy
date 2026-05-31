@@ -105,12 +105,23 @@ class PointNetEncoderXYZRGB(nn.Module):
         else:
             raise NotImplementedError(f"final_norm: {final_norm}")
          
-    def forward(self, x):
+    def forward(self, x, valid_mask=None):
+        # x: (B, N, in_channels)
+        # valid_mask: (B, N) bool, True for real points, False for padding.
+        # Padding points (all-zero xyz/rgb, seg label 0) must not influence the
+        # symmetric max-pool, otherwise their post-MLP features can win the max
+        # and corrupt the global descriptor. We push them to -inf before pooling.
         x = self.mlp(x)
+        if valid_mask is not None:
+            neg_inf = torch.finfo(x.dtype).min
+            x = x.masked_fill(~valid_mask.unsqueeze(-1), neg_inf)
         x = torch.max(x, 1)[0]
+        # Guard: if an entire cloud were padding, max over -inf gives -inf.
+        # Replace any non-finite entries with 0 so downstream stays finite.
+        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
         x = self.final_projection(x)
         return x
-    
+
 
 class PointNetEncoderXYZ(nn.Module):
     """Encoder for Pointcloud
@@ -297,18 +308,30 @@ class DP3Encoder(nn.Module):
         points = observations[self.point_cloud_key]
         assert len(points.shape) == 3, cprint(f"point cloud shape: {points.shape}, length should be 3", "red")
 
+        valid_mask = None
         if self.one_hot_seg:
+            # The seg channel is identity-normalized (see dataset get_normalizer),
+            # so points[..., seg_channel_idx] holds the RAW integer label in {0,1,2,3}.
+            #   label 0 = padding (zero xyz/rgb inserted to keep point count fixed)
+            #   labels 1,2,3 = real semantic classes
             seg = points[..., self.seg_channel_idx]
-            # Limits normalizer maps {1,2,3} → {-1,0,1} exactly; recover 0-indexed class.
-            seg_idx = (seg + 1.0).round().clamp(0, self.num_seg_classes - 1).long()
+            seg_idx = seg.round().clamp(0, self.num_seg_classes - 1).long()
             one_hot = F.one_hot(seg_idx, num_classes=self.num_seg_classes).float()
             points = torch.cat([points[..., :self.seg_channel_idx], one_hot], dim=-1)
+            # Padding points (label 0) get masked out of the max-pool.
+            valid_mask = seg_idx != 0  # (B, N) bool
 
         if self.use_imagined_robot:
             img_points = observations[self.imagination_key][..., :points.shape[-1]] # align the last dim
             points = torch.concat([points, img_points], dim=1)
+            if valid_mask is not None:
+                # Imagined-robot points are always real — mark them valid.
+                B = valid_mask.shape[0]
+                n_img = img_points.shape[1]
+                img_valid = torch.ones((B, n_img), dtype=valid_mask.dtype, device=valid_mask.device)
+                valid_mask = torch.cat([valid_mask, img_valid], dim=1)
 
-        pn_feat = self.extractor(points)    # B * out_channel
+        pn_feat = self.extractor(points, valid_mask=valid_mask)    # B * out_channel
             
         state = observations[self.state_key]
         state_feat = self.state_mlp(state)  # B * 64

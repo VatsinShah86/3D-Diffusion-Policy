@@ -302,6 +302,22 @@ class EpisodeZarrDataset(BaseDataset):
         }
         normalizer = LinearNormalizer()
         normalizer.fit(data=data, last_n_dims=1, mode=mode, **kwargs)
+
+        # The point-cloud seg channel (index 6) is a categorical label in
+        # {0,1,2,3} (0 = padding). It must NOT be limits-scaled, or the encoder's
+        # raw-label one-hot recovery breaks. Force that single channel to identity
+        # (scale=1, offset=0) so the raw integer label passes through unchanged.
+        # xyz (0:3) and rgb (3:6) keep their limits scaling.
+        SEG_IDX = 6
+        pc_params = normalizer.params_dict['point_cloud']
+        assert len(pc_params['scale']) == 7, (
+            f"Expected point_cloud normalizer scale to have 7 elements, "
+            f"got {len(pc_params['scale'])}. Check last_n_dims or point cloud feature dim."
+        )
+        with torch.no_grad():
+            pc_params['scale'][SEG_IDX]  = 1.0
+            pc_params['offset'][SEG_IDX] = 0.0
+
         return normalizer
 
     def get_all_actions(self) -> torch.Tensor:

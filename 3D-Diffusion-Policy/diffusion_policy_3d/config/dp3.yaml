@@ -62,7 +62,7 @@ policy:
   pointnet_type: "pointnet"
   one_hot_seg: true
   seg_channel_idx: 6
-  num_seg_classes: 3
+  num_seg_classes: 4   # {0:padding, 1,2,3:real classes}
 
   pointcloud_encoder_cfg:
     in_channels: 7
