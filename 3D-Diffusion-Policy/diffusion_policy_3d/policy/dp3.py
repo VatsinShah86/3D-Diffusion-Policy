@@ -42,6 +42,9 @@ class DP3(BasePolicy):
             one_hot_seg=False,
             seg_channel_idx=6,
             num_seg_classes=3,
+            separate_gripper_head=False,
+            lambda_gripper=1.0,
+            gripper_pos_weight=1.9,
             # parameters passed to step
             **kwargs):
         super().__init__()
@@ -57,7 +60,17 @@ class DP3(BasePolicy):
             action_dim = action_shape[0] * action_shape[1]
         else:
             raise NotImplementedError(f"Unsupported action shape {action_shape}")
-            
+
+        self.separate_gripper_head = separate_gripper_head
+        self.gripper_action_idx = 6
+        self.lambda_gripper = lambda_gripper
+        self.gripper_threshold = 0.2
+        self.register_buffer('gripper_pos_weight', torch.tensor(float(gripper_pos_weight)))
+        self.diffusion_action_dim = (action_dim - 1) if separate_gripper_head else action_dim
+
+        if separate_gripper_head:
+            assert obs_as_global_cond, "separate_gripper_head requires obs_as_global_cond=True"
+
         obs_shape_meta = shape_meta['obs']
         obs_dict = dict_apply(obs_shape_meta, lambda x: x['shape'])
 
@@ -75,10 +88,10 @@ class DP3(BasePolicy):
 
         # create diffusion model
         obs_feature_dim = obs_encoder.output_shape()
-        input_dim = action_dim + obs_feature_dim
+        input_dim = self.diffusion_action_dim + obs_feature_dim
         global_cond_dim = None
         if obs_as_global_cond:
-            input_dim = action_dim
+            input_dim = self.diffusion_action_dim
             if "cross_attention" in self.condition_type:
                 global_cond_dim = obs_feature_dim
             else:
@@ -109,11 +122,19 @@ class DP3(BasePolicy):
         self.obs_encoder = obs_encoder
         self.model = model
         self.noise_scheduler = noise_scheduler
-        
-        
+
+        self.gripper_head = None
+        if self.separate_gripper_head:
+            gripper_in_dim = obs_feature_dim * n_obs_steps  # obs_as_global_cond guaranteed
+            self.gripper_head = nn.Sequential(
+                nn.Linear(gripper_in_dim, 256), nn.ReLU(),
+                nn.Linear(256, 128), nn.ReLU(),
+                nn.Linear(128, n_action_steps),
+            )
+
         self.noise_scheduler_pc = copy.deepcopy(noise_scheduler)
         self.mask_generator = LowdimMaskGenerator(
-            action_dim=action_dim,
+            action_dim=self.diffusion_action_dim,
             obs_dim=0 if obs_as_global_cond else obs_feature_dim,
             max_n_obs_steps=n_obs_steps,
             fix_obs_steps=True,
@@ -195,7 +216,7 @@ class DP3(BasePolicy):
         value = next(iter(nobs.values()))
         B, To = value.shape[:2]
         T = self.horizon
-        Da = self.action_dim
+        Da = self.diffusion_action_dim
         Do = self.obs_feature_dim
         To = self.n_obs_steps
 
@@ -239,27 +260,41 @@ class DP3(BasePolicy):
             **self.kwargs)
         
         # unnormalize prediction
-        naction_pred = nsample[...,:Da]
-        action_pred = self.normalizer['action'].unnormalize(naction_pred)
+        if self.separate_gripper_head:
+            pose_pred = self._unnormalize_pose(nsample[..., :Da])  # (B, T, 6)
+            action_pred = torch.zeros(B, T, self.action_dim,
+                                      device=pose_pred.device, dtype=pose_pred.dtype)
+            action_pred[..., :self.gripper_action_idx] = pose_pred
+        else:
+            naction_pred = nsample[..., :Da]
+            action_pred = self.normalizer['action'].unnormalize(naction_pred)
 
         # get action
         start = To - 1
         end = start + self.n_action_steps
-        action = action_pred[:,start:end]
-        
-        # get prediction
-
+        action = action_pred[:, start:end].clone()
+        if self.separate_gripper_head:
+            gripper_logits = self.gripper_head(global_cond)          # (B, n_action_steps)
+            gripper_bin = (torch.sigmoid(gripper_logits) > 0.5).float()
+            action[..., self.gripper_action_idx] = gripper_bin
 
         result = {
             'action': action,
             'action_pred': action_pred,
         }
-        
+
         return result
 
     # ========= training  ============
     def set_normalizer(self, normalizer: LinearNormalizer):
         self.normalizer.load_state_dict(normalizer.state_dict())
+
+    def _unnormalize_pose(self, naction_pose: torch.Tensor) -> torch.Tensor:
+        """Unnormalize the 6 pose dims by padding a dummy gripper column, then slicing."""
+        B, T, _ = naction_pose.shape
+        pad = torch.zeros(B, T, 1, device=naction_pose.device, dtype=naction_pose.dtype)
+        full = torch.cat([naction_pose, pad], dim=-1)   # (B, T, 7)
+        return self.normalizer['action'].unnormalize(full)[..., :self.gripper_action_idx]
 
     def compute_loss(self, batch):
         # normalize input
@@ -276,7 +311,13 @@ class DP3(BasePolicy):
         # handle different ways of passing observation
         local_cond = None
         global_cond = None
-        trajectory = nactions
+        if self.separate_gripper_head:
+            gidx = self.gripper_action_idx
+            trajectory = nactions[..., :gidx]                          # (B, T, 6) pose only
+            raw_gripper = batch['action'][..., gidx]                   # (B, T) raw command
+            gripper_target = (raw_gripper > self.gripper_threshold).float()
+        else:
+            trajectory = nactions                                       # (B, T, 7) original
         cond_data = trajectory
         
        
@@ -364,14 +405,17 @@ class DP3(BasePolicy):
         loss = loss.mean()
         
 
-        loss_dict = {
-                'bc_loss': loss.item(),
-            }
+        loss_dict = {'bc_loss': loss.item()}
+        total_loss = loss
+        if self.separate_gripper_head:
+            gripper_logits = self.gripper_head(global_cond)            # (B, n_action_steps)
+            start = self.n_obs_steps - 1
+            end = start + self.n_action_steps
+            assert end <= horizon, f"gripper window {start}:{end} exceeds horizon {horizon}"
+            g_tgt = gripper_target[:, start:end]
+            gripper_loss = F.binary_cross_entropy_with_logits(
+                gripper_logits, g_tgt, pos_weight=self.gripper_pos_weight)
+            total_loss = loss + self.lambda_gripper * gripper_loss
+            loss_dict['gripper_bce'] = gripper_loss.item()
 
-        # print(f"t2-t1: {t2-t1:.3f}")
-        # print(f"t3-t2: {t3-t2:.3f}")
-        # print(f"t4-t3: {t4-t3:.3f}")
-        # print(f"t5-t4: {t5-t4:.3f}")
-        # print(f"t6-t5: {t6-t5:.3f}")
-        
-        return loss, loss_dict
+        return total_loss, loss_dict

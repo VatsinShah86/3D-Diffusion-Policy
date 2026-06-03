@@ -51,7 +51,7 @@ policy:
     clip_sample: True
     set_alpha_to_one: True
     steps_offset: 0
-    prediction_type: sample
+    prediction_type: epsilon
 
 
   num_inference_steps: 10
@@ -63,6 +63,10 @@ policy:
   one_hot_seg: true
   seg_channel_idx: 6
   num_seg_classes: 4   # {0:padding, 1,2,3:real classes}
+
+  separate_gripper_head: false   # true → U-Net denoises 6 dims, MLP head predicts binary gripper
+  lambda_gripper: 1.0
+  gripper_pos_weight: 1.9        # ≈ (1-0.34)/0.34 to counteract open-class imbalance
 
   pointcloud_encoder_cfg:
     in_channels: 7
@@ -78,7 +82,7 @@ ema:
   inv_gamma: 1.0
   power: 0.75
   min_value: 0.0
-  max_value: 0.9999
+  max_value: 0.999
 
 dataloader:
   batch_size: 128
@@ -114,7 +118,7 @@ training:
   gradient_accumulate_every: 1
   use_ema: True
   rollout_every: 200
-  checkpoint_every: 100
+  checkpoint_every: 50
   val_every: 2
   sample_every: 5
   max_train_steps: null
@@ -142,14 +146,14 @@ checkpoint:
   save_last_snapshot: True
 
 multi_run:
-  run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  run_dir: /mnt/hdd8tb/vatsin/run_outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
   wandb_name_base: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
 
 hydra:
   job:
     override_dirname: ${name}
   run:
-    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    dir: /mnt/hdd8tb/vatsin/run_outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
   sweep:
-    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    dir: /mnt/hdd8tb/vatsin/run_outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
     subdir: ${hydra.job.num}

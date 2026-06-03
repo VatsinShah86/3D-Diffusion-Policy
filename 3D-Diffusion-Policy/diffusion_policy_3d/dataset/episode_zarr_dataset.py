@@ -350,7 +350,7 @@ class EpisodeZarrDataset(BaseDataset):
                 n_drop = max(1, int(N * self.aug_dropout_ratio))
                 drop_idx = np.random.choice(N, size=n_drop, replace=False)
                 fill_idx = np.random.choice(N, size=n_drop, replace=True)
-                pc[t, drop_idx] = pc[t, fill_idx]
+                pc[t, drop_idx, :6] = pc[t, fill_idx, :6]
 
             # Per-channel color noise, clipped to [0, 255]
             if self.aug_color_sigma > 0.0:

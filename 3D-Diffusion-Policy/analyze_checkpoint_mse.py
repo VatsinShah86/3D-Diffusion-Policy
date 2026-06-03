@@ -104,32 +104,61 @@ def eval_checkpoint(
     pos_mse_acc = rot_mse_acc = grip_mse_acc = 0.0
     grip_close_steps = grip_total_steps = 0
     grip_bce_acc = 0.0
+    grip_flip_rate_acc = 0.0       # mean transitions per executed chunk (n_action_steps window)
+    grip_always_open_acc = 0.0     # fraction of chunks where every step predicts OPEN
     n_batches = 0
+
+    # For separate_gripper_head=True, action_pred[...,6] is all zeros (head only fills
+    # the executed window in result["action"]). All gripper metrics use the executed
+    # window from result["action"] so both head=True and head=False are comparable.
+    win_start = policy.n_obs_steps - 1
+    win_end   = win_start + policy.n_action_steps
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(val_loader):
             if batch_idx >= max_batches:
                 break
 
-            batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
-            gt    = batch["action"]                                        # (B, horizon, 7)
-            pred  = policy.predict_action(batch["obs"])["action_pred"]     # (B, horizon, 7)
+            batch  = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
+            gt     = batch["action"]                                   # (B, horizon, 7)
+            result = policy.predict_action(batch["obs"])
+            pred   = result["action_pred"]                             # (B, horizon, 7)
+            act    = result["action"]                                  # (B, n_action_steps, 7)
 
+            # pos/rot MSE over full horizon (both paths have valid pose predictions)
             pos_mse_acc  += torch.nn.functional.mse_loss(pred[..., 0:3], gt[..., 0:3]).item()
             rot_mse_acc  += torch.nn.functional.mse_loss(pred[..., 3:6], gt[..., 3:6]).item()
-            grip_mse_acc += torch.nn.functional.mse_loss(pred[..., 6:7], gt[..., 6:7]).item()
 
-            # Fraction of predicted steps classified as CLOSE
-            g_pred = pred[..., 6]                                          # (B, horizon)
-            grip_close_steps += int((g_pred < GRIP_THRESHOLD).sum().item())
-            grip_total_steps += int(g_pred.numel())
+            # Gripper metrics always use the EXECUTED window from result["action"].
+            # For head=True, act[...,6] contains binary {0,1} from the classifier.
+            # For head=False, act[...,6] == pred[:,win_start:win_end,6] (same values).
+            gt_window = gt[:, win_start:win_end]                       # (B, n_action_steps, 7)
+            g_act  = act[..., 6]                                       # (B, n_action_steps)
+            g_gt_w = gt_window[..., 6]                                 # (B, n_action_steps)
+
+            grip_mse_acc += torch.nn.functional.mse_loss(g_act, g_gt_w).item()
+
+            grip_close_steps += int((g_act < GRIP_THRESHOLD).sum().item())
+            grip_total_steps += int(g_act.numel())
 
             # BCE: how well does the prediction distinguish open vs close?
-            # Target is binary: gt > threshold → open (1), else close (0)
-            g_gt_bin = (gt[..., 6] > GRIP_THRESHOLD).float()
+            g_gt_bin = (g_gt_w > GRIP_THRESHOLD).float()
             grip_bce_acc += torch.nn.functional.binary_cross_entropy(
-                g_pred.clamp(1e-6, 1 - 1e-6), g_gt_bin
+                g_act.clamp(1e-6, 1 - 1e-6), g_gt_bin
             ).item()
+
+            # Oscillation metrics over the EXECUTED window (n_action_steps steps).
+            # This matches what the robot actually receives each inference cycle.
+            binary = (g_act > GRIP_THRESHOLD)
+
+            # Flip rate: number of open↔close transitions within one chunk.
+            # A perfectly consistent chunk scores 0; a fully alternating one scores n_act-1.
+            flips = (binary[:, 1:] != binary[:, :-1]).float().sum(dim=1)  # (B,)
+            grip_flip_rate_acc += flips.mean().item()
+
+            # Always-open fraction: did every step in the chunk predict OPEN?
+            # Rising toward 1.0 over epochs signals mode collapse.
+            grip_always_open_acc += (binary.all(dim=1)).float().mean().item()
 
             n_batches += 1
 
@@ -139,14 +168,17 @@ def eval_checkpoint(
     if n_batches == 0:
         nan = float("nan")
         return {"pos_mse": nan, "rot_mse": nan, "gripper_mse": nan,
-                "gripper_close_frac": nan, "gripper_bce": nan}
+                "gripper_close_frac": nan, "gripper_bce": nan,
+                "gripper_flip_rate": nan, "gripper_always_open_frac": nan}
 
     return {
-        "pos_mse":           pos_mse_acc  / n_batches,
-        "rot_mse":           rot_mse_acc  / n_batches,
-        "gripper_mse":       grip_mse_acc / n_batches,
-        "gripper_close_frac": grip_close_steps / grip_total_steps,
-        "gripper_bce":       grip_bce_acc / n_batches,
+        "pos_mse":               pos_mse_acc        / n_batches,
+        "rot_mse":               rot_mse_acc         / n_batches,
+        "gripper_mse":           grip_mse_acc        / n_batches,
+        "gripper_close_frac":    grip_close_steps    / grip_total_steps,
+        "gripper_bce":           grip_bce_acc        / n_batches,
+        "gripper_flip_rate":     grip_flip_rate_acc  / n_batches,
+        "gripper_always_open_frac": grip_always_open_acc / n_batches,
     }
 
 
@@ -157,18 +189,17 @@ def plot_results(epochs: list[int], results: list[dict], run_dir: Path, run_name
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    pos_mse    = [r["pos_mse"]            for r in results]
-    rot_mse    = [r["rot_mse"]            for r in results]
-    grip_mse   = [r["gripper_mse"]        for r in results]
-    close_frac = [r["gripper_close_frac"] for r in results]
-    grip_bce   = [r["gripper_bce"]        for r in results]
+    pos_mse      = [r["pos_mse"]                 for r in results]
+    rot_mse      = [r["rot_mse"]                 for r in results]
+    grip_mse     = [r["gripper_mse"]             for r in results]
+    close_frac   = [r["gripper_close_frac"]      for r in results]
+    grip_bce     = [r["gripper_bce"]             for r in results]
+    flip_rate    = [r["gripper_flip_rate"]        for r in results]
+    always_open  = [r["gripper_always_open_frac"] for r in results]
 
-    # GT close fraction (constant — dataset property, not checkpoint-dependent)
-    # Compute once from the first result's val data; approximate via training label stats.
-    # We annotate the plot with gt_close_frac if available, else skip.
-
-    fig, axes = plt.subplots(1, 5, figsize=(24, 5))
+    fig, axes = plt.subplots(2, 4, figsize=(22, 9))
     fig.suptitle(f"{run_name}\nPer-dimension metrics vs training epoch", fontsize=11)
+    axes = axes.flatten()
 
     def _panel(ax, y, title, color, ylabel, hline=None, hline_label=None):
         ax.plot(epochs, y, color=color, linewidth=1.2, marker=".", markersize=4)
@@ -187,6 +218,13 @@ def plot_results(epochs: list[int], results: list[dict], run_dir: Path, run_name
     _panel(axes[3], close_frac, "Predicted CLOSE fraction", "#e45756", "Fraction of steps",
            hline=0.34, hline_label="GT close frac ≈ 0.34")
     _panel(axes[4], grip_bce,   "Gripper BCE",              "#b279a2", "BCE loss")
+    _panel(axes[5], flip_rate,  "Gripper flip rate",        "#ff7f0e",
+           "Mean transitions / chunk",
+           hline=0.0, hline_label="ideal (0 flips)")
+    _panel(axes[6], always_open, "Always-OPEN chunk frac",  "#d62728",
+           "Fraction of chunks",
+           hline=1.0, hline_label="full collapse")
+    axes[7].axis("off")   # spare panel
 
     plt.tight_layout()
 
@@ -206,7 +244,8 @@ def save_csv(epochs: list[int], results: list[dict], run_dir: Path) -> None:
     out_path = out_dir / "checkpoint_mse.csv"
     with open(out_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["epoch", "pos_mse", "rot_mse", "gripper_mse",
-                                               "gripper_close_frac", "gripper_bce"])
+                                               "gripper_close_frac", "gripper_bce",
+                                               "gripper_flip_rate", "gripper_always_open_frac"])
         writer.writeheader()
         for ep, r in zip(epochs, results):
             writer.writerow({"epoch": ep, **r})
@@ -240,7 +279,8 @@ def analyze_run(run_dir: Path, max_batches: int, device: str) -> None:
         r = eval_checkpoint(ckpt_path, val_loader, max_batches, device)
         print(f"  pos={r['pos_mse']:.5f}  rot={r['rot_mse']:.5f}  "
               f"grip_mse={r['gripper_mse']:.5f}  "
-              f"close_frac={r['gripper_close_frac']:.4f}  bce={r['gripper_bce']:.4f}")
+              f"close_frac={r['gripper_close_frac']:.4f}  bce={r['gripper_bce']:.4f}  "
+              f"flip_rate={r['gripper_flip_rate']:.4f}  always_open={r['gripper_always_open_frac']:.4f}")
         epochs.append(epoch)
         results.append(r)
 
