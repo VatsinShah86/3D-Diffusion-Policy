@@ -45,6 +45,8 @@ class DP3(BasePolicy):
             separate_gripper_head=False,
             lambda_gripper=1.0,
             gripper_pos_weight=1.9,
+            gripper_condition_on_prev=True,
+            gripper_prev_dropout=0.5,
             # parameters passed to step
             **kwargs):
         super().__init__()
@@ -63,8 +65,11 @@ class DP3(BasePolicy):
 
         self.separate_gripper_head = separate_gripper_head
         self.gripper_action_idx = 6
+        self.gripper_width_obs_idx = 6
         self.lambda_gripper = lambda_gripper
         self.gripper_threshold = 0.2
+        self.gripper_condition_on_prev = gripper_condition_on_prev
+        self.gripper_prev_dropout = gripper_prev_dropout
         self.register_buffer('gripper_pos_weight', torch.tensor(float(gripper_pos_weight)))
         self.diffusion_action_dim = (action_dim - 1) if separate_gripper_head else action_dim
 
@@ -125,12 +130,20 @@ class DP3(BasePolicy):
 
         self.gripper_head = None
         if self.separate_gripper_head:
-            gripper_in_dim = obs_feature_dim * n_obs_steps  # obs_as_global_cond guaranteed
+            if obs_as_global_cond and "cross_attention" not in self.condition_type:
+                gripper_in_dim = obs_feature_dim * n_obs_steps
+            else:
+                gripper_in_dim = obs_feature_dim
+            self.gripper_extra_dim = 2 if self.gripper_condition_on_prev else 0
+            gripper_in_dim = gripper_in_dim + self.gripper_extra_dim
             self.gripper_head = nn.Sequential(
                 nn.Linear(gripper_in_dim, 256), nn.ReLU(),
                 nn.Linear(256, 128), nn.ReLU(),
                 nn.Linear(128, n_action_steps),
             )
+
+        # Inference-time running state: gripper command committed last chunk.
+        self._prev_gripper_cmd = None
 
         self.noise_scheduler_pc = copy.deepcopy(noise_scheduler)
         self.mask_generator = LowdimMaskGenerator(
@@ -157,8 +170,20 @@ class DP3(BasePolicy):
 
         print_params(self)
         
+    def reset(self):
+        super().reset()
+        self._prev_gripper_cmd = None
+
+    def _gripper_head_input(self, global_cond, prev_gripper, curr_width):
+        """Concatenate global_cond with prev_gripper and curr_width scalars."""
+        if not self.gripper_condition_on_prev:
+            return global_cond
+        prev = prev_gripper.reshape(-1, 1).to(global_cond.dtype)
+        width = curr_width.reshape(-1, 1).to(global_cond.dtype)
+        return torch.cat([global_cond, prev, width], dim=-1)
+
     # ========= inference  ============
-    def conditional_sample(self, 
+    def conditional_sample(self,
             condition_data, condition_mask,
             condition_data_pc=None, condition_mask_pc=None,
             local_cond=None, global_cond=None,
@@ -274,9 +299,18 @@ class DP3(BasePolicy):
         end = start + self.n_action_steps
         action = action_pred[:, start:end].clone()
         if self.separate_gripper_head:
-            gripper_logits = self.gripper_head(global_cond)          # (B, n_action_steps)
+            curr_width = nobs['agent_pos'][:, self.n_obs_steps - 1, self.gripper_width_obs_idx]
+            if self.gripper_condition_on_prev:
+                if self._prev_gripper_cmd is None:
+                    self._prev_gripper_cmd = torch.ones(B, device=global_cond.device, dtype=global_cond.dtype)
+                head_in = self._gripper_head_input(global_cond, self._prev_gripper_cmd, curr_width)
+            else:
+                head_in = global_cond
+            gripper_logits = self.gripper_head(head_in)              # (B, n_action_steps)
             gripper_bin = (torch.sigmoid(gripper_logits) > 0.5).float()
             action[..., self.gripper_action_idx] = gripper_bin
+            if self.gripper_condition_on_prev:
+                self._prev_gripper_cmd = gripper_bin[:, -1].detach()
 
         result = {
             'action': action,
@@ -408,10 +442,22 @@ class DP3(BasePolicy):
         loss_dict = {'bc_loss': loss.item()}
         total_loss = loss
         if self.separate_gripper_head:
-            gripper_logits = self.gripper_head(global_cond)            # (B, n_action_steps)
             start = self.n_obs_steps - 1
             end = start + self.n_action_steps
             assert end <= horizon, f"gripper window {start}:{end} exceeds horizon {horizon}"
+
+            if self.gripper_condition_on_prev:
+                prev_idx = max(start - 1, 0)
+                prev_gripper = gripper_target[:, prev_idx]             # (B,) in {0,1}
+                if self.training and self.gripper_prev_dropout > 0:
+                    drop = torch.rand_like(prev_gripper) < self.gripper_prev_dropout
+                    prev_gripper = torch.where(drop, torch.full_like(prev_gripper, 0.5), prev_gripper)
+                curr_width = nobs['agent_pos'][:, self.n_obs_steps - 1, self.gripper_width_obs_idx]
+                head_in = self._gripper_head_input(global_cond, prev_gripper, curr_width)
+            else:
+                head_in = global_cond
+
+            gripper_logits = self.gripper_head(head_in)                # (B, n_action_steps)
             g_tgt = gripper_target[:, start:end]
             gripper_loss = F.binary_cross_entropy_with_logits(
                 gripper_logits, g_tgt, pos_weight=self.gripper_pos_weight)
