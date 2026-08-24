@@ -1,0 +1,10 @@
+[33mgpu id (to use): 3[0m
+[33mTrain mode[0m
+[DP3Encoder] point cloud shape: [2048, 7]
+[DP3Encoder] state shape: [7]
+[DP3Encoder] imagination point shape: None
+pointnet use_layernorm: True
+pointnet use_final_norm: layernorm
+[DP3Encoder] output dim: 128
+[DiffusionUnetHybridPointcloudPolicy] use_pc_color: True
+[DiffusionUnetHybridPointcloudPolicy] pointnet_type: pointnet

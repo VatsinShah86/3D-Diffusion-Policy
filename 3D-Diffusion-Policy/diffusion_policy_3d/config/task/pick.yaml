@@ -1,12 +1,12 @@
-name: rope_manip
+name: pick
 
-task_name: rope
+task_name: pick
 
 shape_meta: &shape_meta
   # acceptable types: rgb, low_dim
   obs:
     point_cloud:
-      shape: [2048, 7]
+      shape: [2048, 6]
       type: point_cloud
     agent_pos:
       shape: [7]
@@ -18,13 +18,13 @@ env_runner: null
 
 dataset:
   _target_: diffusion_policy_3d.dataset.episode_zarr_dataset.EpisodeZarrDataset
-  zarr_path: /mnt/hdd8tb/vatsin/YOLO_SAM2_processed/real_dataset_rope_ego
+  zarr_path: data/pick_abs_action_cont_grip
   horizon: ${horizon}
   pad_before: ${eval:'${n_obs_steps}-1'}
   pad_after: ${eval:'${n_action_steps}-1'}
   seed: 42
   val_ratio: 0.2
-  max_train_episodes: 90
+  max_train_episodes: 40
   augment: ${augment}
   aug_xyz_sigma: 0.007
   aug_dropout_frame_ratio: 0.20

@@ -64,7 +64,7 @@ policy:
   seg_channel_idx: 6
   num_seg_classes: 4   # {0:padding, 1,2,3:real classes}
 
-  separate_gripper_head: true   # true → U-Net denoises 6 dims, MLP head predicts binary gripper
+  separate_gripper_head: false   # true → U-Net denoises 6 dims, MLP head predicts binary gripper
   lambda_gripper: 1.0
   gripper_pos_weight: 1.9        # ≈ (1-0.34)/0.34 to counteract open-class imbalance
   gripper_condition_on_prev: true
@@ -116,7 +116,7 @@ training:
   lr_warmup_steps: 500
   # lr_scheduler_kwargs:
   #   num_cycles: 5
-  num_epochs: 1500
+  num_epochs: 3000
   gradient_accumulate_every: 1
   use_ema: True
   rollout_every: 200

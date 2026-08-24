@@ -1,4 +1,4 @@
-name: rope_manip_ext_no_seg
+name: rope_manip_abs_act
 
 task_name: rope
 
@@ -6,7 +6,7 @@ shape_meta: &shape_meta
   # acceptable types: rgb, low_dim
   obs:
     point_cloud:
-      shape: [1024, 6]
+      shape: [2048, 7]
       type: point_cloud
     agent_pos:
       shape: [7]
@@ -18,7 +18,7 @@ env_runner: null
 
 dataset:
   _target_: diffusion_policy_3d.dataset.episode_zarr_dataset.EpisodeZarrDataset
-  zarr_path: data/real_dataset_rope_ext
+  zarr_path: /mnt/hdd8tb/vatsin/YOLO_SAM2_processed/real_dataset_rope_ego_abs_action
   horizon: ${horizon}
   pad_before: ${eval:'${n_obs_steps}-1'}
   pad_after: ${eval:'${n_action_steps}-1'}

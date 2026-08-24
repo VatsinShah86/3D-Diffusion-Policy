@@ -1,6 +1,6 @@
-name: rope_manip
+name: real_cloth_manip_ext_seg_cont_grip
 
-task_name: rope
+task_name: cloth
 
 shape_meta: &shape_meta
   # acceptable types: rgb, low_dim
@@ -18,7 +18,7 @@ env_runner: null
 
 dataset:
   _target_: diffusion_policy_3d.dataset.episode_zarr_dataset.EpisodeZarrDataset
-  zarr_path: /mnt/hdd8tb/vatsin/YOLO_SAM2_processed/real_dataset_rope_ego
+  zarr_path: data/real_dataset_cloth_ext_seg_cont_grip
   horizon: ${horizon}
   pad_before: ${eval:'${n_obs_steps}-1'}
   pad_after: ${eval:'${n_action_steps}-1'}
